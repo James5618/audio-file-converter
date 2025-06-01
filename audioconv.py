@@ -1,14 +1,15 @@
 import os
+import traceback
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog,
-    QProgressBar, QLabel, QCheckBox, QHBoxLayout, QComboBox
+    QProgressBar, QLabel, QCheckBox, QHBoxLayout, QComboBox, QTextEdit
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from pydub import AudioSegment
 
 class ConverterThread(QThread):
     progress = pyqtSignal(int)
-    finished = pyqtSignal()
+    finished = pyqtSignal(list)
 
     def __init__(self, folder, overwrite, file_types, destination_folder, bitrate, sample_rate):
         super().__init__()
@@ -18,6 +19,7 @@ class ConverterThread(QThread):
         self.destination_folder = destination_folder
         self.bitrate = bitrate
         self.sample_rate = sample_rate
+        self.failed_files = []
 
     def run(self):
         files = []
@@ -29,21 +31,27 @@ class ConverterThread(QThread):
         total_files = len(files)
 
         for i, file_path in enumerate(files):
-            audio = AudioSegment.from_file(file_path)
-            audio = audio.set_frame_rate(self.sample_rate).set_channels(2).set_sample_width(2)
+            try:
+                if self.overwrite:
+                    output_path = file_path
+                else:
+                    relative_path = os.path.relpath(file_path, self.folder)
+                    output_path = os.path.join(self.destination_folder, relative_path)
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    output_path = os.path.splitext(output_path)[0] + '.mp3'
 
-            if self.overwrite:
-                output_path = file_path
-            else:
-                relative_path = os.path.relpath(file_path, self.folder)
-                output_path = os.path.join(self.destination_folder, relative_path)
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                output_path = os.path.splitext(output_path)[0] + '.mp3'
-
-            audio.export(output_path, format='mp3', bitrate=self.bitrate)
+                if self.overwrite or not os.path.exists(output_path):
+                    audio = AudioSegment.from_file(file_path)
+                    audio = audio.set_frame_rate(self.sample_rate).set_channels(2).set_sample_width(2)
+                    audio.export(output_path, format='mp3', bitrate=self.bitrate)
+            except Exception as e:
+                self.failed_files.append(file_path)
+                with open('conversion_errors.log', 'a') as log_file:
+                    log_file.write(f"{file_path} - {str(e)}\n")
+                    log_file.write(traceback.format_exc() + "\n")
             self.progress.emit(int((i + 1) / total_files * 100))
 
-        self.finished.emit()
+        self.finished.emit(self.failed_files)
 
 class ConverterApp(QWidget):
     def __init__(self):
@@ -52,7 +60,7 @@ class ConverterApp(QWidget):
 
     def initUI(self):
         self.setWindowTitle('Music Converter')
-        self.setGeometry(100, 100, 400, 300)
+        self.setGeometry(100, 100, 400, 400)
 
         layout = QVBoxLayout()
 
@@ -99,6 +107,12 @@ class ConverterApp(QWidget):
         self.progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.progress)
 
+        self.failed_files_label = QLabel('Failed Files:')
+        layout.addWidget(self.failed_files_label)
+        self.failed_files_text = QTextEdit()
+        self.failed_files_text.setReadOnly(True)
+        layout.addWidget(self.failed_files_text)
+
         self.setLayout(layout)
 
     def select_folder(self):
@@ -133,9 +147,13 @@ class ConverterApp(QWidget):
     def update_progress(self, value):
         self.progress.setValue(value)
 
-    def conversion_finished(self):
+    def conversion_finished(self, failed_files):
         self.label.setText('Conversion Finished!')
         self.progress.setValue(100)
+        if failed_files:
+            self.failed_files_text.setPlainText('\n'.join(failed_files))
+        else:
+            self.failed_files_text.setPlainText('No files failed.')
 
 if __name__ == '__main__':
     app = QApplication([])
