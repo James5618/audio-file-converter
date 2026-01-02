@@ -1,5 +1,33 @@
 import os
+import sys
 import traceback
+import shutil
+
+# Set ffmpeg path - cross-platform support
+if sys.platform == 'win32':
+    # Windows: Use local ffmpeg if available
+    ffmpeg_dir = os.path.join(os.path.dirname(__file__), 'ffmpeg', 'ffmpeg-8.0.1-essentials_build', 'bin')
+    if os.path.exists(ffmpeg_dir):
+        os.environ['PATH'] = ffmpeg_dir + os.pathsep + os.environ.get('PATH', '')
+elif sys.platform == 'darwin':
+    # macOS: Check for Homebrew installation
+    homebrew_paths = ['/opt/homebrew/bin', '/usr/local/bin']
+    for path in homebrew_paths:
+        if os.path.exists(os.path.join(path, 'ffmpeg')):
+            os.environ['PATH'] = path + os.pathsep + os.environ.get('PATH', '')
+            break
+    else:
+        # If ffmpeg not found, check if it's already in PATH
+        if not shutil.which('ffmpeg'):
+            print("Warning: ffmpeg not found. Install with: brew install ffmpeg")
+else:
+    # Linux: Check common installation paths
+    if not shutil.which('ffmpeg'):
+        print("Warning: ffmpeg not found. Install with:")
+        print("  Ubuntu/Debian: sudo apt install ffmpeg")
+        print("  Fedora: sudo dnf install ffmpeg")
+        print("  Arch Linux: sudo pacman -S ffmpeg")
+
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog,
     QProgressBar, QLabel, QCheckBox, QHBoxLayout, QComboBox, QTextEdit
@@ -53,6 +81,108 @@ class ConverterThread(QThread):
 
         self.finished.emit(self.failed_files)
 
+class CueSplitterThread(QThread):
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(list)
+
+    def __init__(self, cue_file, audio_file, output_folder):
+        super().__init__()
+        self.cue_file = cue_file
+        self.audio_file = audio_file
+        self.output_folder = output_folder
+        self.failed_files = []
+
+    def parse_cue(self):
+        tracks = []
+        current_track = {}
+        
+        try:
+            with open(self.cue_file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+        except UnicodeDecodeError:
+            with open(self.cue_file, 'r', encoding='latin-1') as f:
+                lines = f.readlines()
+        
+        for line in lines:
+            line = line.strip()
+            if line.startswith('TRACK'):
+                if current_track:
+                    tracks.append(current_track)
+                parts = line.split()
+                current_track = {'number': int(parts[1])}
+            elif line.startswith('TITLE'):
+                title = line.split('TITLE', 1)[1].strip().strip('"')
+                if 'number' in current_track:
+                    current_track['title'] = title
+            elif line.startswith('PERFORMER'):
+                performer = line.split('PERFORMER', 1)[1].strip().strip('"')
+                if 'number' in current_track:
+                    current_track['performer'] = performer
+            elif line.startswith('INDEX 01'):
+                time_str = line.split('INDEX 01', 1)[1].strip()
+                parts = time_str.split(':')
+                minutes = int(parts[0])
+                seconds = int(parts[1])
+                frames = int(parts[2])
+                total_ms = (minutes * 60 + seconds) * 1000 + (frames * 1000 // 75)
+                current_track['start'] = total_ms
+        
+        if current_track:
+            tracks.append(current_track)
+        
+        return tracks
+
+    def run(self):
+        try:
+            # Normalize paths for OneDrive/SharePoint
+            self.cue_file = os.path.normpath(self.cue_file)
+            self.audio_file = os.path.normpath(self.audio_file)
+            self.output_folder = os.path.normpath(self.output_folder)
+            
+            # Verify files exist
+            if not os.path.exists(self.cue_file):
+                raise FileNotFoundError(f"Cue file not found: {self.cue_file}")
+            if not os.path.exists(self.audio_file):
+                raise FileNotFoundError(f"Audio file not found: {self.audio_file}")
+            if not os.path.exists(self.output_folder):
+                os.makedirs(self.output_folder, exist_ok=True)
+            
+            tracks = self.parse_cue()
+            audio = AudioSegment.from_file(self.audio_file)
+            total_tracks = len(tracks)
+
+            for i, track in enumerate(tracks):
+                try:
+                    start_time = track['start']
+                    end_time = tracks[i + 1]['start'] if i + 1 < len(tracks) else len(audio)
+                    
+                    track_audio = audio[start_time:end_time]
+                    
+                    track_num = str(track['number']).zfill(2)
+                    title = track.get('title', f'Track {track_num}')
+                    # Sanitize filename
+                    title = ''.join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()
+                    filename = f"{track_num} - {title}.flac"
+                    output_path = os.path.join(self.output_folder, filename)
+                    
+                    track_audio.export(output_path, format='flac')
+                    
+                except Exception as e:
+                    self.failed_files.append(f"Track {track.get('number', 'unknown')}: {str(e)}")
+                    with open('cue_split_errors.log', 'a') as log_file:
+                        log_file.write(f"Track {track.get('number', 'unknown')} - {str(e)}\n")
+                        log_file.write(traceback.format_exc() + "\n")
+                
+                self.progress.emit(int((i + 1) / total_tracks * 100))
+        
+        except Exception as e:
+            self.failed_files.append(f"General error: {str(e)}")
+            with open('cue_split_errors.log', 'a') as log_file:
+                log_file.write(f"General error - {str(e)}\n")
+                log_file.write(traceback.format_exc() + "\n")
+        
+        self.finished.emit(self.failed_files)
+
 class ConverterApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -64,7 +194,7 @@ class ConverterApp(QWidget):
 
         layout = QVBoxLayout()
 
-        self.label = QLabel('Select a folder containing .m4a and .flac files to convert:')
+        self.label = QLabel('Select a folder containing .m4a, .flac, and .wv files to convert:')
         layout.addWidget(self.label)
 
         self.button = QPushButton('Select Folder')
@@ -78,6 +208,9 @@ class ConverterApp(QWidget):
         self.flac_checkbox = QCheckBox('.flac')
         self.flac_checkbox.setChecked(True)
         self.file_type_layout.addWidget(self.flac_checkbox)
+        self.wv_checkbox = QCheckBox('.wv')
+        self.wv_checkbox.setChecked(True)
+        self.file_type_layout.addWidget(self.wv_checkbox)
         layout.addLayout(self.file_type_layout)
 
         self.overwrite_checkbox = QCheckBox('Overwrite original files')
@@ -103,6 +236,10 @@ class ConverterApp(QWidget):
         self.convert_button.clicked.connect(self.convert_files)
         layout.addWidget(self.convert_button)
 
+        self.cue_split_button = QPushButton('Split Audio with Cue Sheet')
+        self.cue_split_button.clicked.connect(self.split_with_cue)
+        layout.addWidget(self.cue_split_button)
+
         self.progress = QProgressBar()
         self.progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.progress)
@@ -125,6 +262,22 @@ class ConverterApp(QWidget):
         if self.destination_folder:
             self.label.setText(f'Selected Destination Folder: {self.destination_folder}')
 
+    def split_with_cue(self):
+        cue_file, _ = QFileDialog.getOpenFileName(self, 'Select Cue File', '', 'Cue Files (*.cue)')
+        if cue_file:
+            audio_file, _ = QFileDialog.getOpenFileName(
+                self, 'Select Audio File', 
+                os.path.dirname(cue_file),
+                'Audio Files (*.flac *.wv)'
+            )
+            if audio_file:
+                output_folder = QFileDialog.getExistingDirectory(self, 'Select Output Folder')
+                if output_folder:
+                    self.thread = CueSplitterThread(cue_file, audio_file, output_folder)
+                    self.thread.progress.connect(self.update_progress)
+                    self.thread.finished.connect(self.cue_split_finished)
+                    self.thread.start()
+
     def convert_files(self):
         if hasattr(self, 'folder'):
             overwrite = self.overwrite_checkbox.isChecked()
@@ -133,6 +286,8 @@ class ConverterApp(QWidget):
                 file_types.append('.m4a')
             if self.flac_checkbox.isChecked():
                 file_types.append('.flac')
+            if self.wv_checkbox.isChecked():
+                file_types.append('.wv')
             bitrate = self.bitrate_combo.currentText()
             sample_rate = int(self.sample_rate_combo.currentText())
             self.thread = ConverterThread(
@@ -154,6 +309,14 @@ class ConverterApp(QWidget):
             self.failed_files_text.setPlainText('\n'.join(failed_files))
         else:
             self.failed_files_text.setPlainText('No files failed.')
+
+    def cue_split_finished(self, failed_files):
+        self.label.setText('Cue Split Finished!')
+        self.progress.setValue(100)
+        if failed_files:
+            self.failed_files_text.setPlainText('\n'.join(failed_files))
+        else:
+            self.failed_files_text.setPlainText('All tracks split successfully.')
 
 if __name__ == '__main__':
     app = QApplication([])
